@@ -5,14 +5,13 @@ use hyper;
 use indexmap::IndexSet;
 use std::{error, fmt};
 use std::net::SocketAddr;
-use tower_h2;
 
 use Conditional;
 use drain;
 use never::Never;
-use svc::{Stack, Service, stack::StackMakeService};
+use svc::{Stack, Service};
 use transport::{connect, tls, Connection, GetOriginalDst, Peek};
-use proxy::http::glue::{HttpBody, HttpBodyNewSvc, HyperServerSvc};
+use proxy::http::glue::{HttpBody, HyperServerSvc};
 use proxy::protocol::Protocol;
 use proxy::tcp;
 use super::Accept;
@@ -56,14 +55,14 @@ where
         http::Request<HttpBody>,
         Response = http::Response<B>,
     >,
-    B: tower_h2::Body,
+    B: hyper::body::Payload,
     // Determines the original destination of an intercepted server socket.
     G: GetOriginalDst,
 {
     disable_protocol_detection_ports: IndexSet<u16>,
     drain_signal: drain::Watch,
     get_orig_dst: G,
-    h1: hyper::server::conn::Http,
+    http: hyper::server::conn::Http,
     h2_settings: h2::server::Builder,
     listen_addr: SocketAddr,
     accept: A,
@@ -199,9 +198,7 @@ where
     R::Value: 'static,
     <R::Value as Service<http::Request<HttpBody>>>::Error: error::Error + Send + Sync + 'static,
     <R::Value as Service<http::Request<HttpBody>>>::Future: Send + 'static,
-    B: tower_h2::Body + Default + Send + 'static,
-    B::Data: Send,
-    <B::Data as ::bytes::IntoBuf>::Buf: Send,
+    B: hyper::body::Payload + Default + Send + 'static,
     G: GetOriginalDst,
 {
 
@@ -222,7 +219,7 @@ where
             disable_protocol_detection_ports,
             drain_signal,
             get_orig_dst,
-            h1: hyper::server::conn::Http::new(),
+            http: hyper::server::conn::Http::new(),
             h2_settings,
             listen_addr,
             accept,
@@ -287,8 +284,8 @@ where
                 (p, io)
             });
 
-        let h1 = self.h1.clone();
-        let h2_settings = self.h2_settings.clone();
+        let http = self.http.clone();
+        let _h2_settings = self.h2_settings.clone();
         let route = self.route.clone();
         let connect = self.connect.clone();
         let drain_signal = self.drain_signal.clone();
@@ -313,7 +310,7 @@ where
                                     log_clone.executor(),
                                 );
                                 // Enable support for HTTP upgrades (CONNECT and websockets).
-                                let conn = h1
+                                let conn = http
                                     .serve_connection(io, svc)
                                     .with_upgrades();
                                 drain_signal
@@ -327,18 +324,24 @@ where
                     }),
                     Protocol::Http2 => Either::B({
                         trace!("detected HTTP/2");
-                        let new_service = StackMakeService::new(route, source.clone());
-                        let mut h2 = tower_h2::Server::new(
-                            HttpBodyNewSvc::new(new_service),
-                            h2_settings,
-                            log_clone.executor(),
-                        );
-                        let serve = h2.serve_modified(io, move |r: &mut http::Request<()>| {
-                            r.extensions_mut().insert(source.clone());
-                        });
-                        drain_signal
-                            .watch(serve, |conn| conn.graceful_shutdown())
-                            .map_err(|e| trace!("h2 server error: {:?}", e))
+                        match route.make(&source) {
+                            Err(never) => match never {},
+                            Ok(s) => {
+                                let svc = HyperServerSvc::new(
+                                    s,
+                                    drain_signal.clone(),
+                                    log_clone.executor(),
+                                );
+                                let conn = http
+                                    .serve_connection(io, svc);
+                                drain_signal
+                                    .watch(conn, |conn| {
+                                        conn.graceful_shutdown();
+                                    })
+                                    .map(|_| ())
+                                    .map_err(|e| trace!("http2 server error: {:?}", e))
+                            },
+                        }
                     }),
                 }),
             });

@@ -1020,7 +1020,6 @@ fn http1_requests_without_host_have_unique_connections() {
 }
 
 #[test]
-#[cfg_attr(not(feature = "flaky_tests"), ignore)]
 fn retry_reconnect_errors() {
     let _ = env_logger_init();
 
